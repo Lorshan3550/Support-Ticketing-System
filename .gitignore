@@ -1,0 +1,32 @@
+# compiled output
+dist/
+node_modules/
+
+# logs
+logs
+*.log
+npm-debug.log*
+
+# env
+.env
+.env.*.local
+
+# generated prisma client
+generated/
+
+# tests
+coverage/
+.nyc_output
+
+# IDE
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# OS
+.DS_Store
+
+# db
+*.pid
+
+4-week-prompt-plan.md

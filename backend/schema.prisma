@@ -1,0 +1,484 @@
+// Multi-tenant support-ticket system — Prisma schema
+// MVP models are marked. Stretch models can be commented out if you want a leaner start.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- Enums ----------
+
+enum TenantPlan {
+  free
+  pro
+  enterprise
+}
+
+enum TenantStatus {
+  active
+  suspended
+  trial
+}
+
+enum UserRole {
+  owner
+  agent
+  customer
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  on_hold
+  resolved
+  closed
+}
+
+enum TicketPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+enum TicketChannel {
+  web
+  email
+  chat
+  api
+}
+
+enum SlaBreachType {
+  first_response
+  resolution
+}
+
+enum SubscriptionStatus {
+  active
+  past_due
+  canceled
+}
+
+enum IntegrationProvider {
+  slack
+  email
+  api
+}
+
+// ---------- Core tenancy & identity (MVP) ----------
+
+model Tenant {
+  id        String       @id @default(uuid())
+  name      String
+  subdomain String       @unique
+  plan      TenantPlan   @default(free)
+  status    TenantStatus @default(trial)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  users        User[]
+  admins       Admin[]
+  categories   Category[]
+  tickets      Ticket[]
+  tags         Tag[]
+  teams        Team[]
+  invitations  Invitation[]
+  slaPolicies  SlaPolicy[]
+  cannedResponses CannedResponse[]
+  notifications   Notification[]
+  auditLogs       AuditLog[]
+  webhooks        Webhook[]
+  integrations    Integration[]
+  subscription    Subscription?
+  kbArticles      KnowledgeBaseArticle[]
+
+  @@map("tenants")
+}
+
+model User {
+  id           String    @id @default(uuid())
+  tenantId     String    @map("tenant_id")
+  email        String
+  passwordHash String    @map("password_hash")
+  fullName     String    @map("full_name")
+  role         UserRole  @default(customer)
+  avatarUrl    String?   @map("avatar_url")
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  tenant             Tenant               @relation(fields: [tenantId], references: [id])
+  ticketsCreated     Ticket[]             @relation("TicketCreatedBy")
+  ticketsAssigned    Ticket[]             @relation("TicketAssignedTo")
+  comments           Comment[]
+  teamMemberships    TeamMember[]
+  attachments        Attachment[]
+  cannedResponses    CannedResponse[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  kbArticles         KnowledgeBaseArticle[]
+  statusChanges      TicketStatusHistory[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("users")
+}
+
+// Admin is a separate principal from User — not a User.role value.
+// Admins manage tenant settings, users, and categories; they are not part
+// of the ticket-handling flow (creating/assigning/commenting on tickets
+// stays with User roles owner/agent/customer). Authenticate separately
+// with their own login endpoint and JWT principalType claim.
+model Admin {
+  id           String    @id @default(uuid())
+  tenantId     String    @map("tenant_id")
+  email        String
+  passwordHash String    @map("password_hash")
+  fullName     String    @map("full_name")
+  avatarUrl    String?   @map("avatar_url")
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  auditLogs AuditLog[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("admins")
+}
+
+model Team {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id])
+  members TeamMember[]
+  tickets Ticket[]
+
+  @@index([tenantId])
+  @@map("teams")
+}
+
+model TeamMember {
+  id     String @id @default(uuid())
+  teamId String @map("team_id")
+  userId String @map("user_id")
+
+  team Team @relation(fields: [teamId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([teamId, userId])
+  @@map("team_members")
+}
+
+model Invitation {
+  id         String    @id @default(uuid())
+  tenantId   String    @map("tenant_id")
+  email      String
+  role       UserRole
+  invitedBy  String    @map("invited_by")
+  token      String    @unique
+  expiresAt  DateTime  @map("expires_at")
+  acceptedAt DateTime? @map("accepted_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("invitations")
+}
+
+// ---------- Ticketing core (MVP) ----------
+
+model Category {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant     Tenant                  @relation(fields: [tenantId], references: [id])
+  tickets    Ticket[]
+  kbArticles KnowledgeBaseArticle[]
+
+  @@index([tenantId])
+  @@map("categories")
+}
+
+model Ticket {
+  id          String         @id @default(uuid())
+  tenantId    String         @map("tenant_id")
+  categoryId  String?        @map("category_id")
+  teamId      String?        @map("team_id")
+  createdBy   String         @map("created_by")
+  assignedTo  String?        @map("assigned_to")
+  subject     String
+  description String
+  status      TicketStatus   @default(open)
+  priority    TicketPriority @default(medium)
+  channel     TicketChannel  @default(web)
+  dueAt       DateTime?      @map("due_at")
+  resolvedAt  DateTime?      @map("resolved_at")
+  closedAt    DateTime?      @map("closed_at")
+  createdAt   DateTime       @default(now()) @map("created_at")
+  updatedAt   DateTime       @updatedAt @map("updated_at")
+
+  tenant     Tenant   @relation(fields: [tenantId], references: [id])
+  category   Category? @relation(fields: [categoryId], references: [id])
+  team       Team?     @relation(fields: [teamId], references: [id])
+  creator    User      @relation("TicketCreatedBy", fields: [createdBy], references: [id])
+  assignee   User?     @relation("TicketAssignedTo", fields: [assignedTo], references: [id])
+
+  comments       Comment[]
+  attachments    Attachment[]
+  ticketTags     TicketTag[]
+  statusHistory  TicketStatusHistory[]
+  slaBreaches    SlaBreach[]
+  satisfaction   CustomerSatisfactionRating?
+
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("tickets")
+}
+
+model Comment {
+  id             String   @id @default(uuid())
+  ticketId       String   @map("ticket_id")
+  userId         String   @map("user_id")
+  body           String
+  isInternalNote Boolean  @default(false) @map("is_internal_note")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  ticket      Ticket       @relation(fields: [ticketId], references: [id])
+  user        User         @relation(fields: [userId], references: [id])
+  attachments Attachment[]
+
+  @@index([ticketId])
+  @@map("comments")
+}
+
+// ---------- Stretch: attachments, tags, status history ----------
+
+model Attachment {
+  id         String   @id @default(uuid())
+  ticketId   String?  @map("ticket_id")
+  commentId  String?  @map("comment_id")
+  uploadedBy String   @map("uploaded_by")
+  fileUrl    String   @map("file_url")
+  fileName   String   @map("file_name")
+  fileSize   Int      @map("file_size")
+  mimeType   String   @map("mime_type")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  ticket   Ticket?  @relation(fields: [ticketId], references: [id])
+  comment  Comment? @relation(fields: [commentId], references: [id])
+  uploader User     @relation(fields: [uploadedBy], references: [id])
+
+  @@map("attachments")
+}
+
+model Tag {
+  id       String @id @default(uuid())
+  tenantId String @map("tenant_id")
+  name     String
+  color    String
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id])
+  ticketTags TicketTag[]
+
+  @@unique([tenantId, name])
+  @@map("tags")
+}
+
+model TicketTag {
+  id       String @id @default(uuid())
+  ticketId String @map("ticket_id")
+  tagId    String @map("tag_id")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+  tag    Tag    @relation(fields: [tagId], references: [id])
+
+  @@unique([ticketId, tagId])
+  @@map("ticket_tags")
+}
+
+model TicketStatusHistory {
+  id        String       @id @default(uuid())
+  ticketId  String       @map("ticket_id")
+  changedBy String       @map("changed_by")
+  oldStatus TicketStatus @map("old_status")
+  newStatus TicketStatus @map("new_status")
+  changedAt DateTime     @default(now()) @map("changed_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+  user   User   @relation(fields: [changedBy], references: [id])
+
+  @@index([ticketId])
+  @@map("ticket_status_history")
+}
+
+// ---------- Stretch: SLA & quality ----------
+
+model SlaPolicy {
+  id                        String         @id @default(uuid())
+  tenantId                  String         @map("tenant_id")
+  name                      String
+  priority                  TicketPriority
+  firstResponseTimeMinutes  Int            @map("first_response_time_minutes")
+  resolutionTimeMinutes     Int            @map("resolution_time_minutes")
+  createdAt                 DateTime       @default(now()) @map("created_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id])
+  breaches SlaBreach[]
+
+  @@map("sla_policies")
+}
+
+model SlaBreach {
+  id          String        @id @default(uuid())
+  ticketId    String        @map("ticket_id")
+  slaPolicyId String        @map("sla_policy_id")
+  breachType  SlaBreachType @map("breach_type")
+  breachedAt  DateTime      @default(now()) @map("breached_at")
+
+  ticket    Ticket    @relation(fields: [ticketId], references: [id])
+  slaPolicy SlaPolicy @relation(fields: [slaPolicyId], references: [id])
+
+  @@map("sla_breaches")
+}
+
+model CustomerSatisfactionRating {
+  id          String   @id @default(uuid())
+  ticketId    String   @unique @map("ticket_id")
+  rating      Int
+  feedback    String?
+  submittedAt DateTime @default(now()) @map("submitted_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+
+  @@map("customer_satisfaction_ratings")
+}
+
+model CannedResponse {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  title     String
+  body      String
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant  Tenant @relation(fields: [tenantId], references: [id])
+  creator User   @relation(fields: [createdBy], references: [id])
+
+  @@map("canned_responses")
+}
+
+// ---------- Stretch: notifications & audit ----------
+
+model Notification {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  userId    String   @map("user_id")
+  type      String
+  payload   Json
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@index([tenantId, userId])
+  @@map("notifications")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  tenantId   String   @map("tenant_id")
+  userId     String?  @map("user_id")
+  adminId    String?  @map("admin_id")
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  metadata   Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User?  @relation(fields: [userId], references: [id])
+  admin  Admin? @relation(fields: [adminId], references: [id])
+
+  @@index([tenantId])
+  @@map("audit_logs")
+}
+
+// ---------- Stretch: extensibility & billing ----------
+
+model Webhook {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  url       String
+  eventType String   @map("event_type")
+  secret    String
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("webhooks")
+}
+
+model Integration {
+  id        String              @id @default(uuid())
+  tenantId  String              @map("tenant_id")
+  provider  IntegrationProvider
+  config    Json
+  isActive  Boolean             @default(true) @map("is_active")
+  createdAt DateTime            @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("integrations")
+}
+
+model Subscription {
+  id                    String              @id @default(uuid())
+  tenantId              String              @unique @map("tenant_id")
+  plan                  TenantPlan
+  status                SubscriptionStatus  @default(active)
+  stripeCustomerId      String?             @map("stripe_customer_id")
+  stripeSubscriptionId  String?             @map("stripe_subscription_id")
+  currentPeriodEnd      DateTime?           @map("current_period_end")
+  createdAt             DateTime            @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@map("subscriptions")
+}
+
+model KnowledgeBaseArticle {
+  id          String   @id @default(uuid())
+  tenantId    String   @map("tenant_id")
+  categoryId  String?  @map("category_id")
+  title       String
+  body        String
+  isPublished Boolean  @default(false) @map("is_published")
+  createdBy   String   @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id])
+  category Category? @relation(fields: [categoryId], references: [id])
+  author   User      @relation(fields: [createdBy], references: [id])
+
+  @@index([tenantId])
+  @@map("knowledge_base_articles")
+}
