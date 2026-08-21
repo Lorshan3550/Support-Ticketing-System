@@ -31,18 +31,49 @@ Every table that has a `tenant_id` column MUST be queried through the scoped
 repository layer — never through a raw Prisma call in a service or
 controller. This is the single most important rule in this codebase.
 
-- Auth guard extracts `tenantId` and `role` from the JWT.
-- A request-scoped `TenantContextService` holds `tenantId` for the life of
-  the request.
-- Prisma middleware (`prisma.$use`) auto-injects `where: { tenantId }` on
-  every read/write to a tenant-scoped model. See `schema.prisma` for which
-  models carry `tenant_id`.
+- `TenantContextMiddleware` opens an AsyncLocalStorage context at the edge of
+  every request, before guards run.
+- The JWT strategy verifies the token and writes the resolved principal
+  (`tenantId`, `principalId`, `principalType`, `role`) into that context.
+- `TenantContextService` (`src/tenancy/`) is a **singleton backed by
+  AsyncLocalStorage**, not `Scope.REQUEST`. Rationale, which is worth being
+  able to recite: the Prisma client extension below is built once at boot and
+  cannot inject a request-scoped provider; request scope bubbles up through
+  every consumer; and BullMQ workers have no HTTP request at all.
+  `runInTenant(tenantId, fn)` gives login and background jobs the same
+  mechanism the request path uses.
+- Every accessor on `TenantContextService` **fails closed** — no tenant in
+  scope throws `TenantContextUnavailableError` (a 500). "No tenant" must never
+  degrade into "all tenants".
+- A Prisma **client extension** (`src/tenancy/prisma-tenant-extension.ts`)
+  auto-injects `where: { tenantId }` on every read/write to a tenant-scoped
+  model, and forces `tenantId` onto creates. Note: `prisma.$use` middleware
+  was removed in Prisma 5+; `$extends` with a `query` component is the
+  replacement. Because `$extends` returns a NEW client, the tenant-scoped
+  client lives behind its own DI token, `SCOPED_PRISMA`.
+- Repositories for tenant-scoped models inject `SCOPED_PRISMA`
+  (`@InjectScopedPrisma()`). Only `TenantsRepository` and lifecycle code
+  inject `PrismaService` directly — grep for `PrismaService` to audit this.
 - Never write a query that takes `tenantId` as a manual argument passed
   through several layers — pull it from `TenantContextService` at the
   repository boundary instead. Manual threading is how isolation bugs creep
-  in.
-- Any new tenant-scoped model added to `schema.prisma` must be added to the
-  Prisma middleware's scoped-model list in the same commit.
+  in. No repository method should have a `tenantId` parameter.
+- Any new tenant-scoped model added to `schema.prisma` must be added to
+  `TENANT_SCOPED_MODELS` in `src/tenancy/tenant-scoped-models.ts` in the same
+  commit. `tenant-scoped-models.spec.ts` diffs that list against the Prisma
+  DMMF, so forgetting is a failing test rather than a silent hole.
+
+Known boundaries of the extension, deliberate and documented in the source:
+only top-level operation args are rewritten (a relation `include` reached from
+a non-scoped root such as `Tenant` is NOT filtered), and `$queryRaw` /
+`$executeRaw` bypass it entirely — don't use raw SQL against tenant-scoped
+tables.
+
+Anything wrapped in `runInTenant(...)` must **await inside the callback**. The
+service does this for you, and there is a regression test pinning it: Prisma
+returns a lazy `PrismaPromise` that only starts on `.then()`, so handing one
+out of the ALS scope and awaiting it at the call site would run the query with
+no tenant in context.
 
 If you (Claude Code) are about to write a `prisma.ticket.findMany(...)` or
 similar directly in a service, stop — route it through the repository layer
