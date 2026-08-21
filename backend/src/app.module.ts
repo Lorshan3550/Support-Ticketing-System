@@ -16,7 +16,7 @@ import { TenancyModule } from './tenancy/tenancy.module';
     ConfigModule.forRoot({ isGlobal: true }),
     PrismaModule,
     TenancyModule,
-  , AuthModule],
+   AuthModule],
   controllers: [AppController],
   providers: [],
 })
