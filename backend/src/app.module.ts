@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
+import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { TenantContextMiddleware } from './tenancy/tenant-context.middleware';
 import { TenancyModule } from './tenancy/tenancy.module';
@@ -15,7 +16,7 @@ import { TenancyModule } from './tenancy/tenancy.module';
     ConfigModule.forRoot({ isGlobal: true }),
     PrismaModule,
     TenancyModule,
-  ],
+  , AuthModule],
   controllers: [AppController],
   providers: [],
 })
