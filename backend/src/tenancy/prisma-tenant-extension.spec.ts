@@ -1,5 +1,8 @@
 import { scopeOperationToTenant } from './prisma-tenant-extension';
-import { TenantContextUnavailableError } from './tenant-context.errors';
+import {
+  TenantContextUnavailableError,
+  TenantScopeViolationError,
+} from './tenant-context.errors';
 
 const TENANT = 'tenant-a';
 
@@ -106,6 +109,92 @@ describe('scopeOperationToTenant', () => {
       expect(
         scopeOperationToTenant(operation, { where: { id: 'x' } }, TENANT),
       ).toEqual({ where: { id: 'x', tenantId: TENANT } });
+    });
+
+    /**
+     * Prisma accepts two vocabularies for the same foreign key and the
+     * isolation layer has to block both. Stripping the scalar `tenantId` alone
+     * left the relation form wide open: the checked input carries no
+     * `tenantId` key to strip, so `data: { tenant: { connect: ... } }` reached
+     * the database as `SET tenant_id = <other tenant>` and pushed the caller's
+     * own row out of their tenant.
+     */
+    describe('the checked-input escape hatch', () => {
+      const connectToOtherTenant = { connect: { id: 'tenant-b' } };
+
+      it.each(['update', 'updateMany', 'updateManyAndReturn'])(
+        'refuses to %s a row into another tenant via the relation',
+        (operation) => {
+          expect(() =>
+            scopeOperationToTenant(
+              operation,
+              { where: { id: 'x' }, data: { tenant: connectToOtherTenant } },
+              TENANT,
+            ),
+          ).toThrow(TenantScopeViolationError);
+        },
+      );
+
+      it.each(['create', 'createManyAndReturn'])(
+        'refuses to %s a row into another tenant via the relation',
+        (operation) => {
+          expect(() =>
+            scopeOperationToTenant(
+              operation,
+              { data: { name: 'n', tenant: connectToOtherTenant } },
+              TENANT,
+            ),
+          ).toThrow(TenantScopeViolationError);
+        },
+      );
+
+      it('checks every row of a createMany payload, not just the first', () => {
+        expect(() =>
+          scopeOperationToTenant(
+            'createMany',
+            {
+              data: [
+                { name: 'a' },
+                { name: 'b', tenant: connectToOtherTenant },
+              ],
+            },
+            TENANT,
+          ),
+        ).toThrow(TenantScopeViolationError);
+      });
+
+      it.each(['create', 'update'])(
+        'rejects the %s half of an upsert',
+        (half) => {
+          expect(() =>
+            scopeOperationToTenant(
+              'upsert',
+              {
+                where: { id: 'x' },
+                create: { name: 'n' },
+                update: { name: 'n2' },
+                [half]: { name: 'n', tenant: connectToOtherTenant },
+              },
+              TENANT,
+            ),
+          ).toThrow(TenantScopeViolationError);
+        },
+      );
+
+      it('leaves other relations alone', () => {
+        // Only the tenant relation is forbidden. Scoping a ticket to its
+        // category is ordinary, legitimate work.
+        expect(() =>
+          scopeOperationToTenant(
+            'update',
+            {
+              where: { id: 'x' },
+              data: { category: { connect: { id: 'cat-1' } } },
+            },
+            TENANT,
+          ),
+        ).not.toThrow();
+      });
     });
 
     it('scopes both halves of an upsert', () => {
