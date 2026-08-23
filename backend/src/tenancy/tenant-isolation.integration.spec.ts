@@ -6,7 +6,10 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaModule } from '../prisma/prisma.module';
 import { SCOPED_PRISMA, type ScopedPrismaClient } from './scoped-prisma';
 import { TenancyModule } from './tenancy.module';
-import { TenantContextUnavailableError } from './tenant-context.errors';
+import {
+  TenantContextUnavailableError,
+  TenantScopeViolationError,
+} from './tenant-context.errors';
 import { TenantContextService } from './tenant-context.service';
 
 /**
@@ -145,6 +148,40 @@ describe('tenant isolation (integration)', () => {
     );
 
     expect(created.tenantId).toBe(tenantA);
+  });
+
+  /**
+   * The scalar `tenantId` above is only half the attack surface. Prisma
+   * accepts the same change expressed as a relation, and that form carries no
+   * `tenantId` key for the extension to strip — so before this was fixed, a
+   * caller could push one of their OWN rows out into another tenant. The
+   * `where` clause was never the weak point; the payload was.
+   */
+  it('refuses to move a row into another tenant via the tenant relation', async () => {
+    const mine = await tenantContext.runInTenant(tenantA, () =>
+      prisma.category.create({
+        data: { name: `move-${suffix}`, tenantId: tenantA },
+        select: { id: true },
+      }),
+    );
+
+    await expect(
+      tenantContext.runInTenant(tenantA, () =>
+        prisma.category.update({
+          where: { id: mine.id },
+          data: { tenant: { connect: { id: tenantB } } },
+        }),
+      ),
+    ).rejects.toThrow(TenantScopeViolationError);
+
+    // Read back on the RAW client: the scoped client could not see the row
+    // any more if the move had actually gone through, which would make a
+    // scoped assertion pass for the wrong reason.
+    const unmoved = await raw.category.findUniqueOrThrow({
+      where: { id: mine.id },
+      select: { tenantId: true },
+    });
+    expect(unmoved.tenantId).toBe(tenantA);
   });
 
   it('scopes counts and aggregates', async () => {

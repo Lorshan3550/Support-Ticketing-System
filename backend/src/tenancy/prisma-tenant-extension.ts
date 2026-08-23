@@ -1,5 +1,11 @@
-import { TenantContextUnavailableError } from './tenant-context.errors';
-import { isTenantScopedModel } from './tenant-scoped-models';
+import {
+  TenantContextUnavailableError,
+  TenantScopeViolationError,
+} from './tenant-context.errors';
+import {
+  isTenantScopedModel,
+  TENANT_RELATION_FIELD,
+} from './tenant-scoped-models';
 import type { TenantContextService } from './tenant-context.service';
 
 type QueryArgs = Record<string, unknown> | undefined;
@@ -21,9 +27,51 @@ function scopeWhere(
 }
 
 /**
- * Strips `tenantId` from a write payload so a caller cannot move a row into
- * another tenant. The scope always comes from the request context, never from
- * the request body.
+ * Rejects a write payload that sets the tenant relationship through Prisma's
+ * *checked* input shape.
+ *
+ * Prisma emits two vocabularies for the same foreign key and accepts either
+ * (`data: XOR<XUpdateInput, XUncheckedUpdateInput>`):
+ *
+ *   unchecked:  { tenantId: 'other-tenant' }
+ *   checked:    { tenant: { connect: { id: 'other-tenant' } } }
+ *
+ * Both compile to `SET tenant_id = 'other-tenant'`. `stripTenantId` below
+ * handles the unchecked form; this handles the checked one. Stripping was the
+ * wrong tool for it — the checked input carries no `tenantId` key to strip, so
+ * a denylist over key names silently let the relation form through. Throwing
+ * also beats stripping on its merits: silently discarding half a caller's
+ * payload hides the mistake, and this is always a mistake.
+ *
+ * Only the top level of each payload object is inspected, matching the
+ * extension's documented boundary — nested writes reached from a relation are
+ * not rewritten at all.
+ */
+function assertNoTenantRelationWrite(data: unknown, operation: string): void {
+  if (Array.isArray(data)) {
+    for (const row of data) {
+      assertNoTenantRelationWrite(row, operation);
+    }
+    return;
+  }
+  if (data && typeof data === 'object' && TENANT_RELATION_FIELD in data) {
+    throw new TenantScopeViolationError(
+      `${operation} payload sets the \`${TENANT_RELATION_FIELD}\` relation on a ` +
+        'tenant-scoped model. Which tenant a row belongs to comes from the ' +
+        'request context, never from the caller — remove the relation from the ' +
+        'write payload.',
+    );
+  }
+}
+
+/**
+ * Strips the scalar `tenantId` from a write payload so a caller cannot move a
+ * row into another tenant. The scope always comes from the request context,
+ * never from the request body.
+ *
+ * This covers Prisma's *unchecked* input shape only. The *checked* shape
+ * expresses the same change as a `tenant` relation and is rejected outright by
+ * `assertNoTenantRelationWrite` above.
  */
 function stripTenantId(data: unknown): unknown {
   if (Array.isArray(data)) {
@@ -52,6 +100,10 @@ function withTenantId(data: unknown, tenantId: string): unknown {
  * Prisma 5+ and unique-where inputs accept extra scalar filters. Creates get
  * `tenantId` forced into `data`.
  *
+ * Write payloads are additionally checked for an attempt to set the tenant
+ * relationship in either of the two shapes Prisma accepts — see
+ * `assertNoTenantRelationWrite` and `stripTenantId`.
+ *
  * Unknown operations throw. If a future Prisma release adds an operation this
  * switch does not recognise, the isolation layer fails closed rather than
  * quietly letting an unfiltered query through.
@@ -79,6 +131,7 @@ export function scopeOperationToTenant(
     case 'update':
     case 'updateMany':
     case 'updateManyAndReturn': {
+      assertNoTenantRelationWrite(args?.data, operation);
       const scoped = scopeWhere(args, tenantId);
       return { ...scoped, data: stripTenantId(scoped.data) };
     }
@@ -86,9 +139,12 @@ export function scopeOperationToTenant(
     case 'create':
     case 'createMany':
     case 'createManyAndReturn':
+      assertNoTenantRelationWrite(args?.data, operation);
       return { ...args, data: withTenantId(args?.data, tenantId) };
 
     case 'upsert': {
+      assertNoTenantRelationWrite(args?.create, operation);
+      assertNoTenantRelationWrite(args?.update, operation);
       const scoped = scopeWhere(args, tenantId);
       return {
         ...scoped,
@@ -123,6 +179,12 @@ export function scopeOperationToTenant(
  *     covered. Raw SQL against tenant-scoped tables must not be used.
  *   - Models scoped transitively (`Comment`, `Attachment`, ...) carry no
  *     `tenant_id`, so they are reached through a scoped parent lookup instead.
+ *     Note this fails OPEN: those models are not recognised as scoped, so
+ *     their queries pass through unfiltered.
+ *   - A write payload may not set the tenant relationship in EITHER shape:
+ *     the scalar `tenantId` is stripped and the `tenant` relation is rejected.
+ *     Only the top level of each payload is inspected, so a nested write
+ *     reached from a relation is not covered.
  */
 export function tenantIsolationExtension(tenantContext: TenantContextService) {
   return {
